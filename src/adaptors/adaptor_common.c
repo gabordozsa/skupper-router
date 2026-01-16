@@ -90,6 +90,12 @@ qd_error_t qd_load_adaptor_config(qdr_core_t *core, qd_adaptor_config_t *config,
     if (config->backlog <= 0 || config->backlog > SOMAXCONN)
         config->backlog = SOMAXCONN;
 
+    config->multi_address_strategy =  qd_entity_opt_string(entity, "multiAddressStrategy", "none"); CHECK();
+    if (!strcmp(config->multi_address_strategy, "none") && !strcmp(config->multi_address_strategy, "priorityFailover")) {
+        qd_error(QD_ERROR_VALUE, "Listener multi-address strategy value is invalid");
+        goto error;
+    }
+
     int hplen = strlen(config->host) + strlen(config->port) + 2;
     config->host_port = malloc(hplen);
     snprintf(config->host_port, hplen, "%s:%s", config->host, config->port);
@@ -108,6 +114,19 @@ qd_error_t qd_load_adaptor_config(qdr_core_t *core, qd_adaptor_config_t *config,
     } else {
         config->address = config_address;
     }
+
+    return QD_ERROR_NONE;
+
+error:
+    return qd_error_code();
+}
+
+qd_error_t qd_load_listener_address_config(qdr_core_t *core, qd_listener_address_config_t *config, qd_entity_t *entity)
+{
+    qd_error_clear();
+    config->address = qd_entity_get_string(entity, "address");           CHECK();
+    config->value         = qd_entity_get_long(entity, "value");         CHECK();
+    config->listener_name = qd_entity_get_string(entity, "listenerRef"); CHECK();
 
     return QD_ERROR_NONE;
 

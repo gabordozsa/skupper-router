@@ -948,7 +948,10 @@ static void link_setup_LSIDE_IO(qd_tcp_connection_t *conn)
     qdr_terminus_t *source = qdr_terminus(0);
     char               host[64];  // for numeric remote client IP:port address
 
-    qdr_terminus_set_address(target, li->adaptor_config->address);
+    char *address = qd_adaptor_listener_preferred_address(li->adaptor_listener);
+    qdr_terminus_set_address(target, address);
+    free(address);
+
     qdr_terminus_set_dynamic(source);
 
     qd_raw_conn_get_address_buf(conn->raw_conn, host, sizeof(host));
@@ -2489,6 +2492,32 @@ QD_EXPORT void qd_dispatch_delete_tcp_listener(qd_dispatch_t *qd, void *impl)
         //
         qd_tcp_listener_decref(listener);
     }
+}
+
+QD_EXPORT void *qd_dispatch_configure_tcp_listener_address(qd_dispatch_t *qd, qd_entity_t *entity)
+{
+    SET_THREAD_UNKNOWN;
+    void *listenerAddress;
+    qd_listener_address_config_t address_config;
+    ZERO(&address_config);
+
+    if (qd_load_listener_address_config(tcp_context->core, &address_config, entity) != QD_ERROR_NONE ||
+        !(listenerAddress = qd_adaptor_listener_add_address(&address_config))) {
+        qd_log(LOG_TCP_ADAPTOR, QD_LOG_ERROR, "Unable to create tcp listener address: %s", qd_error_message());
+
+        if (address_config.address)
+            free(address_config.address);
+        if (address_config.listener_name)
+            free(address_config.listener_name);
+
+        return 0;
+    }
+
+    qd_log(LOG_TCP_ADAPTOR, QD_LOG_INFO,
+            "Configured new address for multi-address tcpListener %s %s",
+            address_config.address, address_config.listener_name);
+
+    return listenerAddress;
 }
 
 

@@ -27,6 +27,32 @@
 #include <proton/listener.h>
 #include <proton/proactor.h>
 
+
+// Address selection strategies for multi-address listener
+const char *ADDRESS_STRATEGY_NONE = "none";
+const char *ADDRESS_STRATEGY_PRIORITY_FAILOVER = "priorityFailover";
+
+typedef enum {
+    PRIORITY_FAILOVER // select address with highest priority
+} qd_multi_address_strategy_t;
+
+
+typedef struct qd_listener_address_t qd_listener_address_t;
+
+struct qd_listener_address_t
+{
+    DEQ_LINKS(qd_listener_address_t);
+    char                  *address;
+    uint32_t               priority;
+    bool                   watched;
+    qdr_watch_handle_t     addr_watcher;
+    bool                   reachable; // true if there is at least one active consumer
+    qd_adaptor_listener_t *listener; // needed by the address watcher callbacks
+};
+
+ALLOC_DEFINE(qd_listener_address_t);
+DEQ_DECLARE(qd_listener_address_t, qd_listener_address_list_t);
+
 struct qd_adaptor_listener_t {
 
     // the following fields are mutably shared between multiple threads and
@@ -38,19 +64,20 @@ struct qd_adaptor_listener_t {
     qd_listener_oper_status_t     oper_status;
     char                         *error_message;
     int                           ref_count;
-    bool                          watched;
+    //bool                        watched;
+    qd_listener_address_list_t    addresses;
+    qd_multi_address_strategy_t   adress_strategy;
+    uint32_t                      reachable_address_count;
 
     // the following fields are immutable so they may be accessed without
     // holding the lock:
 
     const qd_dispatch_t          *qd;
     void                         *user_context;
-    char                         *service_address;
     char                         *name;
     char                         *host_port;
     qd_log_module_t               log_module;
     qd_handler_context_t          event_handler;
-    qdr_watch_handle_t            addr_watcher;
     int                           backlog;
 
     // must hold _listeners_lock:
@@ -97,7 +124,15 @@ static void _listener_free(qd_adaptor_listener_t *li)
 {
     free(li->name);
     free(li->host_port);
-    free(li->service_address);
+
+    qd_listener_address_t *addr = DEQ_HEAD(li->addresses);
+    while (addr) {
+        // address watchers hold a ref to the listener so we can only get here
+        // if all addresses get unwatched
+        assert(!addr->watched);
+        free(addr->address);
+        free_qd_listener_address_t(addr);
+    }
     free(li->error_message);
     sys_mutex_free(&li->lock);
     free_qd_adaptor_listener_t(li);
@@ -232,8 +267,10 @@ static void _listener_event_handler(pn_event_t *e, qd_server_t *qd_server, void 
             sys_mutex_unlock(&li->lock);
 
             if (re_created) {
+                qd_listener_address_t *addr = DEQ_HEAD(li->addresses);
+                assert(addr);
                 qd_log(log_module, QD_LOG_DEBUG, "Re-creating listener %s socket on address %s for service address %s",
-                       li->name, li->host_port, li->service_address);
+                       li->name, li->host_port, addr->address);
             }
 
             _listener_decref(li);  // drop temporary reference
@@ -268,21 +305,31 @@ static void _on_watched_address_update(void     *context,
         // the address watch holds a reference count to the listener so it cannot be
         // deleted during this call
         //
-        qd_adaptor_listener_t *li = (qd_adaptor_listener_t*) context;
+        qd_listener_address_t *addr = (qd_listener_address_t*) context;
+        qd_adaptor_listener_t *li = addr->listener;
 
         qd_log(li->log_module, QD_LOG_DEBUG,
                "Listener %s (%s) service address %s consumer count updates:"
                " local=%" PRIu32 " in-process=%" PRIu32 " remote=%" PRIu32,
-               li->name, li->host_port, li->service_address, local_consumers, in_proc_consumers, remote_consumers);
+               li->name, li->host_port, addr->address, local_consumers, in_proc_consumers, remote_consumers);
 
         sys_mutex_lock(&li->lock);
 
         bool created = false;
         bool stopped = false;
         if (li->admin_status == QD_LISTENER_ADMIN_ENABLED) {
-            const bool can_listen = (local_consumers || remote_consumers || in_proc_consumers);
+            const bool has_consumers = (local_consumers || remote_consumers || in_proc_consumers);
 
-            if (can_listen) {
+            if (addr->reachable && !has_consumers) {
+                addr->reachable = false;
+                assert(li->reachable_addresses > 0);
+                li->reachable_address_count--;
+            } else if (!addr->reachable && has_consumers) {
+                addr->reachable = true;
+                li->reachable_address_count++;
+            }
+
+            if (li->reachable_address_count > 0) {
                 if (li->oper_status == QD_LISTENER_OPER_DOWN) {
                     li->oper_status = QD_LISTENER_OPER_OPENING;
                     if (!li->pn_listener) {
@@ -313,11 +360,11 @@ static void _on_watched_address_update(void     *context,
 
         if (stopped)
             qd_log(li->log_module, QD_LOG_DEBUG, "Closing listener %s (%s) socket: no service available for address %s",
-                   li->name, li->host_port, li->service_address);
+                   li->name, li->host_port, addr->address);
 
         else if (created)
             qd_log(li->log_module, QD_LOG_DEBUG, "Creating listener %s (%s) socket for service address %s", li->name,
-                   li->host_port, li->service_address);
+                   li->host_port, addr->address);
     }
 }
 
@@ -325,12 +372,21 @@ static void _on_watched_address_update(void     *context,
 static void _on_watched_address_cancel(void *context)
 {
     if (!_finalized) {
-        qd_adaptor_listener_t *li = (qd_adaptor_listener_t*) context;
+        qd_listener_address_t *addr = (qd_listener_address_t*) context;
+        qd_adaptor_listener_t *li = addr->listener;
 
         sys_mutex_lock(&li->lock);
-        if (li->pn_listener) {
+
+        if (addr->reachable) {
+            addr->reachable = false;
+            assert(li->reachable_addresses > 0);
+            li->reachable_address_count--;
+        }
+        addr->watched = false;
+        if (!li->reachable_address_count && li->pn_listener) {
             pn_listener_close(li->pn_listener);
         }
+
         sys_mutex_unlock(&li->lock);
 
         _listener_decref(li);
@@ -358,9 +414,16 @@ qd_adaptor_listener_t *qd_adaptor_listener(const qd_dispatch_t       *qd,
     li->qd = qd;
     li->name = qd_strdup(config->name);
     li->host_port = qd_strdup(config->host_port);
-    li->service_address = qd_strdup(config->address);
     li->backlog         = config->backlog;
     li->log_module      = module;
+
+    if (strcmp(config->multi_address_strategy, ADDRESS_STRATEGY_NONE) == 0) {
+        // this is a regular (single address) listener
+        qd_listener_address_t *addr = new_qd_listener_address_t();
+        ZERO(addr);
+        addr->address = qd_strdup(config->address);
+        DEQ_INSERT_HEAD(li->addresses, addr);
+    }
 
     sys_mutex_init(&li->lock);
     li->admin_status = QD_LISTENER_ADMIN_ENABLED;
@@ -384,20 +447,27 @@ void qd_adaptor_listener_listen(qd_adaptor_listener_t *li,
     sys_mutex_lock(&li->lock);
 
     assert(li->ref_count > 0);
-    assert(!li->watched);
     assert(!li->on_accept);
+    assert(!li->reachable_addresses);
 
     li->on_accept = on_accept;
     li->user_context = context;
-    li->watched = true;
-    li->ref_count += 1;  // for watcher
-    li->addr_watcher = qdr_core_watch_address(qd_router_core(li->qd),
-                                              li->service_address,
-                                              QD_ITER_HASH_PREFIX_MOBILE,
-                                              li->qd->default_treatment,
-                                              _on_watched_address_update,
-                                              _on_watched_address_cancel,
-                                              (void*) li);
+
+    qd_listener_address_t *addr = DEQ_HEAD(li->addresses);
+    if (addr) { // multi-address listener does not have any address yet at this point
+        assert(!addr->watched);
+
+        addr->watched    = true;
+        li->ref_count += 1;  // for watcher
+        addr->addr_watcher = qdr_core_watch_address(qd_router_core(li->qd),
+                                                    addr->address,
+                                                    QD_ITER_HASH_PREFIX_MOBILE,
+                                                    li->qd->default_treatment,
+                                                    _on_watched_address_update,
+                                                    _on_watched_address_cancel,
+                                                    (void *) addr);
+    }
+
     sys_mutex_unlock(&li->lock);
 }
 
@@ -406,15 +476,22 @@ void qd_adaptor_listener_close(qd_adaptor_listener_t *li)
 {
     if (li) {
         sys_mutex_lock(&li->lock);
+
         li->admin_status = QD_LISTENER_ADMIN_DELETED;
         li->oper_status = QD_LISTENER_OPER_DOWN;
         li->on_accept = 0;
         li->user_context = 0;
 
-        // Cancel the address watcher. The cancel callback will clean up the
+        // Cancel the address watchers. The last cancel callback will clean up the
         // pn_listener.
-        if (li->watched)
-            qdr_core_unwatch_address(qd_dispatch_router_core(li->qd), li->addr_watcher);
+        qd_listener_address_t *addr = DEQ_HEAD(li->addresses);
+        while (addr) {
+            if (addr->watched) {
+                qdr_core_unwatch_address(qd_dispatch_router_core(li->qd), addr->addr_watcher);
+                addr = DEQ_NEXT(addr);
+            }
+        }
+
         sys_mutex_unlock(&li->lock);
 
         _listener_decref(li);
@@ -451,6 +528,82 @@ void qd_adaptor_listener_deny_conn(qd_adaptor_listener_t *listener, pn_listener_
     pn_listener_raw_accept(pn_listener, close_me);
 }
 
+char *qd_adaptor_listener_preferred_address(qd_adaptor_listener_t *listener)
+{
+    char *address;
+
+    sys_mutex_lock(&listener->lock);
+
+    // Addreses are ordered by priority in the address list. Find and return the first reachable one.
+    qd_listener_address_t *addr = DEQ_HEAD(listener->addresses);
+    assert(addr);
+    DEQ_FIND(addr, addr->reachable);
+
+    // Return an address even if none of them is are reachable
+    if (!addr)
+        addr =  DEQ_HEAD(listener->addresses);
+
+    // ListenerAddress entity may be deleted by mgmt right after we release the listener lock
+    address = strdup(addr->address);
+
+    sys_mutex_unlock(&listener->lock);
+
+    return address;
+}
+
+void *qd_adaptor_listener_add_address(qd_listener_address_config_t *config)
+{
+    qd_error_t config_error = QD_ERROR_NONE;
+
+    qd_listener_address_t *new_addr = new_qd_listener_address_t();
+    ZERO(new_addr);
+    new_addr->address = config->address;
+    new_addr->priority = config->value;
+
+    sys_mutex_lock(&_listeners_lock);
+    qd_adaptor_listener_t *li = DEQ_HEAD(_listeners);
+    DEQ_FIND(li, strcmp(li->name, config->listener_name) == 0);
+    sys_mutex_unlock(&_listeners_lock);
+
+    if (li) {
+        sys_mutex_lock(&li->lock);
+
+        if (li->admin_status == QD_LISTENER_ADMIN_ENABLED) {
+            assert(li->ref_count > 0);
+            new_addr->listener = li;
+            qd_listener_address_t *addr = DEQ_HEAD(li->addresses);
+            DEQ_FIND(addr, addr->priority <= new_addr->priority);
+            if (addr && addr->prev) {
+                DEQ_INSERT_AFTER(li->addresses, new_addr, addr->prev);
+            } else {
+                DEQ_INSERT_HEAD(li->addresses, new_addr);
+            }
+            new_addr->watched = true;
+            li->ref_count += 1;  // for watcher
+            new_addr->addr_watcher = qdr_core_watch_address(qd_router_core(li->qd),
+                                                            new_addr->address,
+                                                            QD_ITER_HASH_PREFIX_MOBILE,
+                                                            li->qd->default_treatment,
+                                                            _on_watched_address_update,
+                                                            _on_watched_address_cancel,
+                                                            (void *)new_addr);
+        } else {
+            config_error = qd_error(QD_ERROR_VALUE, "Listener for new address is being deleted %s", li->name);
+        }
+
+        sys_mutex_unlock(&li->lock);
+    } else {
+        config_error = qd_error(QD_ERROR_VALUE, "Listener for new address does not exist %s", li->name);
+    }
+
+    if (config_error != QD_ERROR_NONE) {
+        free_qd_listener_address_t(new_addr);
+        new_addr = 0;
+    }
+
+    return (void *)new_addr;
+}
+
 
 void qd_adaptor_listener_init(void)
 {
@@ -470,3 +623,4 @@ void qd_adaptor_listener_finalize(void)
     }
     sys_mutex_free(&_listeners_lock);
 }
+

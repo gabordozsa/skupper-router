@@ -75,5 +75,13 @@ char *qd_adaptor_listener_error_message(const qd_adaptor_listener_t *listener);
 //
 void qd_adaptor_listener_deny_conn(qd_adaptor_listener_t *listener, pn_listener_t *pn_listener);
 
+// Get the preferred service address for a new connection
+char * qd_adaptor_listener_preferred_address(qd_adaptor_listener_t *listener);
+
+// Add a new item to the service addresses list
+void *qd_adaptor_listener_add_address(qd_listener_address_config_t *config);
+
+// Remve an item from service addresses list
+//void qd_adapter_listener_remove_address(qd_adaptor_listener_t *listener);
 
 #endif // __adaptor_listener_h__
